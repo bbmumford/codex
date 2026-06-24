@@ -242,6 +242,7 @@ impl ExecCommandHandler {
 
         let ExecCommandArgs {
             tty,
+            wake_on_output,
             yield_time_ms,
             max_output_tokens,
             sandbox_permissions,
@@ -356,6 +357,7 @@ impl ExecCommandHandler {
                     shell_mode,
                     network: context.turn.network.clone(),
                     tty,
+                    wake_on_output,
                     sandbox_permissions: effective_additional_permissions.sandbox_permissions,
                     additional_permissions: normalized_additional_permissions,
                     additional_permissions_preapproved: effective_additional_permissions

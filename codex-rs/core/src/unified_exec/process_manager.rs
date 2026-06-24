@@ -50,6 +50,7 @@ use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
+use crate::unified_exec::async_watcher::start_background_output_waker;
 use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::generate_chunk_id;
@@ -484,6 +485,7 @@ impl UnifiedExecProcessManager {
                 start,
                 request.process_id,
                 request.tty,
+                request.wake_on_output,
                 deferred_network_approval.clone(),
                 network_denial_monitor,
                 Arc::clone(&transcript),
@@ -952,18 +954,20 @@ impl UnifiedExecProcessManager {
         started_at: Instant,
         process_id: i32,
         tty: bool,
+        wake_on_output: bool,
         network_approval: Option<DeferredNetworkApproval>,
         network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
     ) {
+        let initial_exec_command_active_for_waker = Arc::clone(&initial_exec_command_active);
         let entry = ProcessEntry {
             process: Arc::clone(&process),
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone(),
             initial_exec_command_active,
-            hook_command,
+            hook_command: hook_command.clone(),
             tty,
             network_approval,
             session: Arc::downgrade(&context.session),
@@ -988,13 +992,23 @@ impl UnifiedExecProcessManager {
             Arc::clone(&context.turn),
             context.call_id.clone(),
             command.to_vec(),
-            cwd,
+            cwd.clone(),
             process_id,
             plugin_attribution,
             transcript,
             started_at,
             network_denial_monitor,
         );
+        if wake_on_output {
+            start_background_output_waker(
+                process,
+                Arc::clone(&context.session),
+                process_id,
+                hook_command,
+                cwd,
+                initial_exec_command_active_for_waker,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

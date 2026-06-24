@@ -49,6 +49,7 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()> 
     let args: ExecCommandArgs = parse_arguments(json)?;
 
     assert!(args.shell.is_none());
+    assert!(!args.wake_on_output);
 
     let resolved = get_command(
         &args,
@@ -61,6 +62,16 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()> 
 
     assert_eq!(command.len(), 3);
     assert_eq!(command[2], "echo hello");
+    Ok(())
+}
+
+#[test]
+fn exec_command_args_parse_wake_on_output() -> anyhow::Result<()> {
+    let json = r#"{"cmd": "fswatch .", "wake_on_output": true}"#;
+
+    let args: ExecCommandArgs = parse_arguments(json)?;
+
+    assert!(args.wake_on_output);
     Ok(())
 }
 

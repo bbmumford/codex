@@ -48,6 +48,13 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             )),
         ),
         (
+            "wake_on_output".to_string(),
+            JsonSchema::boolean(Some(
+                "When true, output emitted after this command yields wakes the agent by delivering a bounded synthetic user message. Use only for explicit monitor/watch commands that should re-enter Codex on later events; defaults to false."
+                    .to_string(),
+            )),
+        ),
+        (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(yield_time_ms_description.to_string())),
         ),
