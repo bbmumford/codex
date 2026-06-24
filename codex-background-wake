@@ -2,6 +2,4 @@
 set -eu
 
 codex_fork_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec "$codex_fork_dir/codex-rs/target/debug/codex" \
-    --enable background_exec_completion_wake \
-    "$@"
+exec "$codex_fork_dir/codex-rs/target/debug/codex" "$@"

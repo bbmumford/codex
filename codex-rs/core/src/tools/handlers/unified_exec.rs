@@ -33,6 +33,8 @@ pub(crate) struct ExecCommandArgs {
     login: Option<bool>,
     #[serde(default = "default_tty")]
     tty: bool,
+    #[serde(default)]
+    wake_on_output: bool,
     #[serde(default = "default_exec_yield_time_ms")]
     yield_time_ms: u64,
     #[serde(default)]
