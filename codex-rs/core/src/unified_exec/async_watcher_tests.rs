@@ -1,8 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use super::BACKGROUND_OUTPUT_WAKE_MAX_BYTES;
 use super::TRAILING_OUTPUT_GRACE;
 use super::append_background_output_wake_bytes;
+use super::drain_background_output_wake_receiver;
 use super::format_background_output_wake_message;
 use super::spawn_exit_watcher;
 use super::split_valid_utf8_prefix_with_max;
@@ -269,4 +271,40 @@ fn background_output_wake_bytes_are_capped() {
 
     assert_eq!(pending.len(), BACKGROUND_OUTPUT_WAKE_MAX_BYTES);
     assert!(truncated);
+}
+
+#[test]
+fn background_output_exit_drain_keeps_late_output_after_yield() {
+    let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+    tx.send(b"late output".to_vec()).expect("send output");
+    let mut pending = Vec::new();
+    let mut truncated = false;
+
+    drain_background_output_wake_receiver(
+        &mut rx,
+        &AtomicBool::new(false),
+        &mut pending,
+        &mut truncated,
+    );
+
+    assert_eq!(pending, b"late output");
+    assert!(!truncated);
+}
+
+#[test]
+fn background_output_exit_drain_discards_initial_exec_output() {
+    let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+    tx.send(b"initial output".to_vec()).expect("send output");
+    let mut pending = Vec::new();
+    let mut truncated = false;
+
+    drain_background_output_wake_receiver(
+        &mut rx,
+        &AtomicBool::new(true),
+        &mut pending,
+        &mut truncated,
+    );
+
+    assert!(pending.is_empty());
+    assert!(!truncated);
 }
