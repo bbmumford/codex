@@ -54,6 +54,11 @@ pub(crate) fn start_background_output_waker(
 ) {
     let mut receiver = process.output_receiver();
     let exit_token = process.cancellation_token();
+    let OutputHandles {
+        output_closed,
+        output_closed_notify,
+        ..
+    } = process.output_handles();
 
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
@@ -65,6 +70,13 @@ pub(crate) fn start_background_output_waker(
         loop {
             tokio::select! {
                 _ = exit_token.cancelled() => {
+                    wait_for_trailing_output(&output_closed, &output_closed_notify).await;
+                    drain_background_output_wake_receiver(
+                        &mut receiver,
+                        &initial_exec_command_active,
+                        &mut pending,
+                        &mut pending_truncated,
+                    );
                     flush_background_output_wake(
                         &mut pending,
                         &mut pending_truncated,
@@ -138,6 +150,57 @@ pub(crate) fn start_background_output_waker(
             }
         }
     });
+}
+
+async fn wait_for_trailing_output(
+    output_closed: &AtomicBool,
+    output_closed_notify: &tokio::sync::Notify,
+) {
+    if output_closed.load(Ordering::Acquire) {
+        return;
+    }
+
+    let closed = output_closed_notify.notified();
+    tokio::pin!(closed);
+    closed.as_mut().enable();
+    if output_closed.load(Ordering::Acquire) {
+        return;
+    }
+
+    tokio::select! {
+        _ = &mut closed => {}
+        _ = tokio::time::sleep(TRAILING_OUTPUT_GRACE) => {}
+    }
+}
+
+fn drain_background_output_wake_receiver(
+    receiver: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
+    initial_exec_command_active: &AtomicBool,
+    pending: &mut Vec<u8>,
+    pending_truncated: &mut bool,
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(chunk) => {
+                if !initial_exec_command_active.load(Ordering::Acquire) {
+                    append_background_output_wake_bytes(pending, &chunk, pending_truncated);
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                if !initial_exec_command_active.load(Ordering::Acquire) {
+                    append_background_output_wake_bytes(
+                        pending,
+                        b"\n[background output omitted because the receiver lagged]\n",
+                        pending_truncated,
+                    );
+                }
+            }
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => break,
+        }
+    }
 }
 
 fn append_background_output_wake_bytes(
