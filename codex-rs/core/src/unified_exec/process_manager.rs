@@ -962,7 +962,7 @@ impl UnifiedExecProcessManager {
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone(),
-            initial_exec_command_active,
+            initial_exec_command_active: Arc::clone(&initial_exec_command_active),
             hook_command,
             tty,
             network_approval,
@@ -994,6 +994,7 @@ impl UnifiedExecProcessManager {
             transcript,
             started_at,
             network_denial_monitor,
+            initial_exec_command_active,
         );
     }
 

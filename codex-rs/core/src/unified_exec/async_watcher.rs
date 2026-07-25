@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use tokio::sync::Mutex;
@@ -10,6 +11,9 @@ use tokio::time::Sleep;
 use super::UnifiedExecContext;
 use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
+use crate::context::ContextualUserFragment;
+use crate::context::InternalContextSource;
+use crate::context::InternalModelContextFragment;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -19,6 +23,7 @@ use crate::tools::events::ToolEventFailure;
 use crate::tools::events::ToolEventStage;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_core_plugins::PluginCommandAttribution;
+use codex_features::Feature;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::protocol::EventMsg;
@@ -36,6 +41,7 @@ pub(crate) const TRAILING_OUTPUT_GRACE: Duration = Duration::from_millis(100);
 /// downstream event consumers (especially app-server JSON-RPC) don't have to
 /// process arbitrarily large delta payloads.
 const UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES: usize = 8192;
+const BACKGROUND_EXEC_COMPLETION_MAX_BYTES: usize = 8192;
 
 /// Spawn a background task that continuously reads from the PTY, appends to the
 /// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
@@ -167,6 +173,7 @@ pub(crate) fn spawn_exit_watcher(
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
     network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
+    initial_exec_command_active: Arc<AtomicBool>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
@@ -184,39 +191,91 @@ pub(crate) fn spawn_exit_watcher(
         let _interaction_guard = interaction_lock.lock_owned().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
-        if let Some(message) = process.failure_message() {
+        let wake_result = if let Some(message) = process.failure_message() {
             emit_failed_exec_end_for_unified_exec(
-                session_ref,
-                turn_ref,
-                call_id,
-                command,
-                cwd,
+                Arc::clone(&session_ref),
+                Arc::clone(&turn_ref),
+                call_id.clone(),
+                command.clone(),
+                cwd.clone(),
                 Some(process_id.to_string()),
                 plugin_attribution,
-                transcript,
+                Arc::clone(&transcript),
                 String::new(),
-                message,
+                message.clone(),
                 duration,
             )
             .await;
+            Err(message)
         } else {
             let exit_code = process.exit_code().unwrap_or(-1);
             emit_exec_end_for_unified_exec(
-                session_ref,
-                turn_ref,
-                call_id,
-                command,
-                cwd,
+                Arc::clone(&session_ref),
+                Arc::clone(&turn_ref),
+                call_id.clone(),
+                command.clone(),
+                cwd.clone(),
                 Some(process_id.to_string()),
                 plugin_attribution,
-                transcript,
+                Arc::clone(&transcript),
                 String::new(),
                 exit_code,
                 duration,
             )
             .await;
+            Ok(exit_code)
+        };
+
+        if !initial_exec_command_active.load(Ordering::Acquire)
+            && session_ref
+                .features()
+                .enabled(Feature::BackgroundExecCompletionWake)
+        {
+            let output = resolve_aggregated_output(&transcript, String::new()).await;
+            let body =
+                background_exec_completion_body(&command, &cwd, process_id, wake_result, &output);
+            let item = InternalModelContextFragment::new(
+                InternalContextSource::from_static("background_exec_completion"),
+                body,
+            )
+            .into_response_input_item()
+            .into();
+            let _ = session_ref.try_start_turn_if_idle(vec![item]).await;
         }
     });
+}
+
+fn background_exec_completion_body(
+    command: &[String],
+    cwd: &PathUri,
+    process_id: i32,
+    result: Result<i32, String>,
+    output: &str,
+) -> String {
+    let status = match result {
+        Ok(exit_code) => format!("exit code {exit_code}"),
+        Err(message) => format!("failure: {message}"),
+    };
+    let output = truncate_utf8(output, BACKGROUND_EXEC_COMPLETION_MAX_BYTES);
+    format!(
+        "A detached background command completed ({status}). Continue the current task using this result.\n\
+         Process ID: {process_id}\n\
+         Working directory: {cwd}\n\
+         Command: {}\n\
+         Output:\n{output}",
+        command.join(" ")
+    )
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &value[..boundary]
 }
 
 async fn process_chunk(

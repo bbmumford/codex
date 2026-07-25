@@ -102,6 +102,8 @@ pub enum Feature {
     CodeModeOnly,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
+    /// Start an idle turn when a detached unified exec command completes.
+    BackgroundExecCompletionWake,
     /// Route shell tool execution through the zsh exec bridge.
     ShellZshFork,
     /// Allow unified exec to compose with the zsh exec bridge.
@@ -852,6 +854,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "unified_exec",
         stage: Stage::Stable,
         default_enabled: !cfg!(windows),
+    },
+    FeatureSpec {
+        id: Feature::BackgroundExecCompletionWake,
+        key: "background_exec_completion_wake",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ShellZshFork,

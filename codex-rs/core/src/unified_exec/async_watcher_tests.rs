@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use super::TRAILING_OUTPUT_GRACE;
+use super::background_exec_completion_body;
 use super::spawn_exit_watcher;
 use super::split_valid_utf8_prefix_with_max;
 use super::start_streaming_output;
+use super::truncate_utf8;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
@@ -14,6 +16,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_sandboxing::SandboxType;
+use codex_utils_path_uri::PathUri;
 
 use pretty_assertions::assert_eq;
 use tokio::time::Duration;
@@ -164,6 +167,7 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         transcript,
         Instant::now(),
         Some(network_denial_monitor),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     );
 
     let exited_at = Instant::now();
@@ -233,4 +237,28 @@ fn split_valid_utf8_prefix_makes_progress_on_invalid_utf8() {
         split_valid_utf8_prefix_with_max(&mut buf, /*max_bytes*/ 2).expect("expected prefix");
     assert_eq!(first, vec![0xff]);
     assert_eq!(buf, b"ab".to_vec());
+}
+
+#[test]
+fn background_exec_completion_body_reports_result_and_output() {
+    let cwd = PathUri::from_host_native_path(std::path::Path::new("/tmp/work"))
+        .expect("absolute test path");
+    let body = background_exec_completion_body(
+        &["printf".to_string(), "done".to_string()],
+        &cwd,
+        42,
+        Ok(0),
+        "done",
+    );
+
+    assert!(body.contains("exit code 0"));
+    assert!(body.contains("Process ID: 42"));
+    assert!(body.contains("Command: printf done"));
+    assert!(body.ends_with("Output:\ndone"));
+}
+
+#[test]
+fn truncate_utf8_preserves_character_boundaries() {
+    assert_eq!(truncate_utf8("aéz", 2), "a");
+    assert_eq!(truncate_utf8("aéz", 3), "aé");
 }
