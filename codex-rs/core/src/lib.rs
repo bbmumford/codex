@@ -8,6 +8,7 @@
 mod apply_patch;
 mod apps;
 mod audio_preparation;
+mod auth_reload_signal;
 mod client;
 mod client_common;
 mod realtime_context;

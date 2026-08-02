@@ -1182,6 +1182,7 @@ impl Session {
                 fork_persistence,
                 next_internal_sub_id: AtomicU64::new(0),
             });
+            crate::auth_reload_signal::install(Arc::clone(&auth_manager));
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
                 *guard = Arc::downgrade(&sess);
