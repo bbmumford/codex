@@ -232,17 +232,6 @@ mod imp {
         Ok(Some(colors))
     }
 
-    /// Queries the terminal cursor position while normal input polling is paused.
-    ///
-    /// Resume can emit a focus report immediately before the cursor-position response. Reusing
-    /// the startup parser lets the probe find the response without leaking either sequence into
-    /// the composer.
-    pub(crate) fn cursor_position(timeout: Duration) -> io::Result<Option<Position>> {
-        let mut tty = Tty::open()?;
-        tty.write_all(b"\x1B[6n")?;
-        read_until(&mut tty, timeout, parse_cursor_position)
-    }
-
     /// Runs the optional terminal queries needed during TUI startup under one shared deadline.
     ///
     /// Keeping these queries batched avoids paying one timeout per unsupported capability before

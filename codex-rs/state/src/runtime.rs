@@ -38,17 +38,21 @@ use std::sync::atomic::AtomicI64;
 use std::time::Instant;
 use tracing::warn;
 
+mod automatic_work;
 mod backfill;
 mod external_agent_config_imports;
 mod goals;
 mod logs;
 mod memories;
+mod model_client_resume_state;
 mod recovery;
 mod remote_control;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod threads;
 
+pub use automatic_work::AutomaticWorkClaimOutcome;
+pub use automatic_work::AutomaticWorkUsageRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportDetailsRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportFailureRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportHistoryRecord;
@@ -58,6 +62,7 @@ pub use goals::GoalAccountingOutcome;
 pub use goals::GoalStore;
 pub use goals::GoalUpdate;
 pub use memories::MemoryStore;
+pub use model_client_resume_state::ModelClientResumeState;
 pub use recovery::RuntimeDbBackup;
 pub(super) use recovery::RuntimeDbInitError;
 pub use recovery::backup_runtime_db_for_fresh_start;

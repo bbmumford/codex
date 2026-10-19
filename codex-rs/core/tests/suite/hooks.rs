@@ -18,6 +18,7 @@ use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -35,6 +36,9 @@ use core_test_support::TestTargetOs;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::hooks::trust_hooks;
 use core_test_support::managed_network_requirements_loader;
+use core_test_support::process::process_is_alive;
+use core_test_support::process::wait_for_pid_file;
+use core_test_support::process::wait_for_process_exit;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -363,6 +367,63 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
         .context("write session start order hook script")?;
     fs::write(&user_prompt_submit_script_path, user_prompt_submit_script)
         .context("write user prompt submit order hook script")?;
+    fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
+fn write_user_prompt_submit_background_watcher(home: &Path) -> Result<()> {
+    let hook_path = home.join("background_watcher_hook.py");
+    let watcher_path = home.join("background_watcher.sh");
+    let pid_path = home.join("background_watcher.pid");
+    let trigger_path = home.join("background_watcher.trigger");
+    let emitted_path = home.join("background_watcher.emitted");
+    let watcher = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$$" > '{pid_path}'
+while [ ! -f '{trigger_path}' ]; do
+  sleep 0.05
+done
+printf '%s\n' 'HOOK-WATCHER-TARGETED-MARKER' > '{emitted_path}'
+cat '{emitted_path}'
+sleep 30
+"#,
+        pid_path = pid_path.display(),
+        trigger_path = trigger_path.display(),
+        emitted_path = emitted_path.display(),
+    );
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "backgroundWatchers": [{
+                "id": "targeted-session-events",
+                "command": ["/bin/sh", watcher_path],
+            }]
+        }
+    })
+    .to_string();
+    let output_literal =
+        serde_json::to_string(&output).context("serialize background watcher hook output")?;
+    let hook = format!(
+        r#"import json
+import sys
+
+json.load(sys.stdin)
+print({output_literal})
+"#,
+    );
+    let hooks = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("python3 {}", hook_path.display()),
+                }]
+            }]
+        }
+    });
+
+    fs::write(&watcher_path, watcher).context("write background watcher fixture")?;
+    fs::write(&hook_path, hook).context("write background watcher hook fixture")?;
     fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
     Ok(())
 }
@@ -1516,6 +1577,95 @@ async fn session_start_runs_before_user_prompt_submit_on_first_turn() -> Result<
         Some("hello")
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_prompt_submit_background_watcher_starts_idle_turn_and_stops_on_shutdown() -> Result<()>
+{
+    skip_if_host_windows!(Ok(()));
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "initial turn finished"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "watcher wake handled"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            write_user_prompt_submit_background_watcher(home)
+                .expect("failed to write background watcher hook fixtures");
+        })
+        .with_config(trust_discovered_hooks);
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("start targeted watcher").await?;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if responses.requests().len() == 1
+                && matches!(test.codex.agent_status().await, AgentStatus::Completed(_))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("initial turn did not become idle")?;
+    let pid = wait_for_pid_file(&test.codex_home_path().join("background_watcher.pid")).await?;
+    assert!(process_is_alive(&pid)?);
+    sleep(Duration::from_millis(250)).await;
+    fs::write(
+        test.codex_home_path().join("background_watcher.trigger"),
+        "",
+    )
+    .context("trigger background watcher after the thread is idle")?;
+    timeout(Duration::from_secs(2), async {
+        while !test
+            .codex_home_path()
+            .join("background_watcher.emitted")
+            .is_file()
+        {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("background watcher did not emit its targeted marker")?;
+    assert!(
+        process_is_alive(&pid)?,
+        "background watcher exited before Codex consumed stdout"
+    );
+    timeout(Duration::from_secs(10), async {
+        while responses.requests().len() < 2 {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("background watcher did not start an idle model request")?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let wake = requests[1]
+        .message_input_texts("user")
+        .into_iter()
+        .find(|text| text.starts_with("<background_output_wake>"))
+        .expect("typed background watcher wake");
+    assert!(wake.contains("HOOK-WATCHER-TARGETED-MARKER"));
+
+    test.codex.shutdown_and_wait().await?;
+    wait_for_process_exit(&pid).await?;
     Ok(())
 }
 

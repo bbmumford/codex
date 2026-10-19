@@ -4261,6 +4261,85 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_window_error_compacts_and_retries_the_same_turn_once() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let context_error = sse_failed(
+        "context-too-large",
+        "context_length_exceeded",
+        "Your input exceeds the context window of this model. Please adjust your input and try again.",
+    );
+    let auto_compact_turn = sse(vec![
+        ev_assistant_message("m2", &auto_summary(AUTO_SUMMARY_TEXT)),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+    ]);
+    let recovered_turn = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 10),
+    ]);
+
+    let failed_request = mount_sse_once(&server, context_error).await;
+    let compact_request = mount_sse_once(&server, auto_compact_turn).await;
+    let recovered_request = mount_sse_once(&server, recovered_turn).await;
+
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(0);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(1_000);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "RECOVER_CONTEXT_WINDOW".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit recovery turn");
+
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    assert!(
+        failed_request
+            .single_request()
+            .body_json()
+            .to_string()
+            .contains("RECOVER_CONTEXT_WINDOW"),
+        "the rejected request should contain the original user input"
+    );
+    assert!(
+        body_contains_text(
+            &compact_request.single_request().body_json().to_string(),
+            SUMMARIZATION_PROMPT,
+        ),
+        "the authoritative context error should trigger compaction"
+    );
+    let recovered_body = recovered_request.single_request().body_json().to_string();
+    assert!(
+        recovered_body.contains(AUTO_SUMMARY_TEXT),
+        "the retried request should use the compacted summary"
+    );
+    assert!(
+        recovered_body.contains("RECOVER_CONTEXT_WINDOW"),
+        "the retried request should preserve the original user input"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_clamps_config_limit_to_context_window() {
     skip_if_no_network!();
 

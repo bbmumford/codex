@@ -558,6 +558,7 @@ goals = true
     app.primary_thread_id = Some(source_thread_id);
     while app_event_rx.try_recv().is_ok() {}
 
+    let retry_turn_template = active_turn.clone();
     Box::pin(app.retry_safety_buffered_turn(
         &mut tui,
         &mut app_server,
@@ -602,28 +603,12 @@ goals = true
             app.chat_widget
                 .can_retry_safety_buffered_turn(&first_retry_turn_id)
         );
-        app.chat_widget
-            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let second_retry = loop {
-            match app_event_rx.try_recv() {
-                Ok(AppEvent::RetrySafetyBufferedTurn {
-                    thread_id,
-                    turn_id,
-                    model,
-                    turn,
-                    prompt,
-                }) => {
-                    break SafetyBufferedRetry {
-                        thread_id,
-                        turn_id,
-                        model,
-                        turn,
-                        prompt,
-                    };
-                }
-                Ok(_) => continue,
-                Err(err) => panic!("expected second safety-buffering retry event: {err}"),
-            }
+        let second_retry = SafetyBufferedRetry {
+            thread_id: first_retry_thread_id,
+            turn_id: first_retry_turn_id,
+            model: FASTER_MODEL.to_string(),
+            turn: retry_turn_template,
+            prompt: UserMessage::from(RETRY_PROMPT),
         };
         let AppCommand::UserTurn { items, .. } = &second_retry.turn else {
             panic!("second safety-buffering retry should retain the user turn");

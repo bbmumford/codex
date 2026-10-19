@@ -93,6 +93,7 @@ pub(crate) struct TurnState {
     mcp_tool_approval_metadata: HashMap<String, McpToolApprovalMetadata>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pub(crate) pending_input: TurnInputQueue,
+    background_output_wake_pending: bool,
     mailbox_delivery_phase: MailboxDeliveryPhase,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     strict_auto_review_enabled: bool,
@@ -218,6 +219,18 @@ impl TurnState {
 
     pub(crate) fn accepts_mailbox_delivery_for_current_turn(&self) -> bool {
         self.mailbox_delivery_phase == MailboxDeliveryPhase::CurrentTurn
+    }
+
+    pub(crate) fn mark_background_output_wake_pending(&mut self) {
+        self.background_output_wake_pending = true;
+    }
+
+    pub(crate) fn clear_background_output_wake_pending(&mut self) {
+        self.background_output_wake_pending = false;
+    }
+
+    pub(crate) fn background_output_wake_pending(&self) -> bool {
+        self.background_output_wake_pending
     }
 
     pub(crate) fn set_mailbox_delivery_phase(&mut self, phase: MailboxDeliveryPhase) {

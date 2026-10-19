@@ -122,9 +122,10 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
 
 /// Scenario: the model advertises a default 273k context window and a 400k max
 /// context window, and the user explicitly configures 1M. This verifies the
-/// runtime turn clamps the override to the advertised max window.
+/// runtime turn honors the explicit override above the advertised max window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_models_config_context_window_override_clamps_to_max_context_window() -> Result<()> {
+async fn remote_models_config_context_window_override_can_exceed_max_context_window() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
@@ -174,7 +175,7 @@ async fn remote_models_config_context_window_override_clamps_to_max_context_wind
         matches!(
             event,
             EventMsg::TurnStarted(started)
-                if started.model_context_window == Some(400_000)
+                if started.model_context_window == Some(1_000_000)
         )
     })
     .await;
@@ -182,16 +183,15 @@ async fn remote_models_config_context_window_override_clamps_to_max_context_wind
         unreachable!("wait_for_event returned unexpected event");
     };
 
-    assert_eq!(turn_started.model_context_window, Some(400_000));
+    assert_eq!(turn_started.model_context_window, Some(1_000_000));
 
     Ok(())
 }
 
 /// Scenario: the user explicitly configures a context window above the model's
-/// max_context_window. This verifies the runtime window is clamped to the max
-/// instead of using the oversized config value.
+/// max_context_window. This verifies the runtime uses the explicit local value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_models_config_override_above_max_uses_max_context_window() -> Result<()> {
+async fn remote_models_config_override_above_max_uses_explicit_context_window() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
@@ -241,7 +241,7 @@ async fn remote_models_config_override_above_max_uses_max_context_window() -> Re
         matches!(
             event,
             EventMsg::TurnStarted(started)
-                if started.model_context_window == Some(400_000)
+                if started.model_context_window == Some(500_000)
         )
     })
     .await;
@@ -249,7 +249,7 @@ async fn remote_models_config_override_above_max_uses_max_context_window() -> Re
         unreachable!("wait_for_event returned unexpected event");
     };
 
-    assert_eq!(turn_started.model_context_window, Some(400_000));
+    assert_eq!(turn_started.model_context_window, Some(500_000));
 
     Ok(())
 }

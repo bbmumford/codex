@@ -35,6 +35,27 @@ impl Session {
         }
     }
 
+    /// Injects a lifecycle wake into active sampling and marks it for a fresh
+    /// continuation only if task teardown wins the race before it is consumed.
+    pub(crate) async fn inject_background_output_wake_if_running(
+        &self,
+        input: Vec<ResponseItem>,
+    ) -> Result<(), Vec<ResponseItem>> {
+        let mut active = self.active_turn.lock().await;
+        match active.as_mut() {
+            Some(active_turn) => {
+                self.input_queue
+                    .extend_background_output_wake_for_turn_state(
+                        active_turn.turn_state.as_ref(),
+                        input.into_iter().map(TurnInput::ResponseItem).collect(),
+                    )
+                    .await;
+                Ok(())
+            }
+            None => Err(input),
+        }
+    }
+
     /// Starts a regular turn with the provided items only if automatic idle work
     /// is allowed for the current session state.
     ///

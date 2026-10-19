@@ -227,7 +227,7 @@ fn baked_personality_section_is_preserved_without_enabled_explicit_none() {
 }
 
 #[test]
-fn model_context_window_override_clamps_to_max_context_window() {
+fn model_context_window_override_is_capped_by_catalog_max_context_window() {
     let mut model = model_info_from_slug("unknown-model");
     model.context_window = Some(273_000);
     model.max_context_window = Some(400_000);
@@ -239,6 +239,23 @@ fn model_context_window_override_clamps_to_max_context_window() {
     let updated = with_config_overrides(model.clone(), &config);
     let mut expected = model;
     expected.context_window = Some(400_000);
+
+    assert_eq!(updated, expected);
+}
+
+#[test]
+fn model_context_window_override_is_unbounded_without_catalog_maximum() {
+    let mut model = model_info_from_slug("custom-model");
+    model.context_window = Some(273_000);
+    model.max_context_window = None;
+    let config = ModelsManagerConfig {
+        model_context_window: Some(500_000),
+        ..Default::default()
+    };
+
+    let updated = with_config_overrides(model.clone(), &config);
+    let mut expected = model;
+    expected.context_window = Some(500_000);
 
     assert_eq!(updated, expected);
 }

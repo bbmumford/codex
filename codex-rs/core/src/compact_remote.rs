@@ -47,6 +47,64 @@ use request::run_remote_compact_attempt;
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
 
+/// Remote context limits can be lower than the catalog value or the local token estimate. When
+/// the compact endpoint rejects an otherwise valid request, retry with progressively smaller
+/// recent-history snapshots. The retries are deliberately bounded so a bad provider estimate
+/// cannot create an unbounded request loop.
+pub(super) const REMOTE_COMPACTION_CONTEXT_RETRY_TARGET_PERCENTS: [i64; 3] = [75, 50, 25];
+
+pub(super) fn trim_history_for_remote_compaction_context_retry(
+    history: &mut ContextManager,
+    turn_context: &TurnContext,
+    base_instructions: &BaseInstructions,
+    target_percent: i64,
+) -> (usize, i64) {
+    let initial_item_count = history.raw_items().len();
+    if initial_item_count <= 1 {
+        return (0, 0);
+    }
+
+    let initial_estimated_tokens = history
+        .estimate_token_count_with_base_instructions(base_instructions)
+        .unwrap_or(i64::MAX);
+    let proportional_target = initial_estimated_tokens
+        .saturating_mul(target_percent)
+        .saturating_div(100);
+    let target_tokens =
+        turn_context
+            .model_context_window()
+            .map_or(proportional_target, |context_window| {
+                proportional_target.min(
+                    context_window
+                        .saturating_mul(target_percent)
+                        .saturating_div(100),
+                )
+            });
+
+    while history.raw_items().len() > 1
+        && history
+            .estimate_token_count_with_base_instructions(base_instructions)
+            .is_some_and(|estimated_tokens| estimated_tokens > target_tokens)
+    {
+        history.remove_first_item();
+    }
+
+    // A provider can reject below our byte-based estimate. Guarantee forward progress even when
+    // the local estimate was already below the nominal retry target.
+    if history.raw_items().len() == initial_item_count && history.raw_items().len() > 1 {
+        history.remove_first_item();
+    }
+
+    let final_item_count = history.raw_items().len();
+    let final_estimated_tokens = history
+        .estimate_token_count_with_base_instructions(base_instructions)
+        .unwrap_or(i64::MAX);
+    (
+        initial_item_count.saturating_sub(final_item_count),
+        initial_estimated_tokens.saturating_sub(final_estimated_tokens),
+    )
+}
+
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,

@@ -249,6 +249,11 @@ pub(crate) async fn run_turn(
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
     let mut next_step_context = Some(first_step_context);
+    // A provider can report a smaller effective window than local metadata predicts. Recover one
+    // time per successfully sampled window by compacting the already-recorded history and
+    // continuing the same turn. Keep the flag set until sampling succeeds so a compaction that
+    // still does not fit cannot loop forever.
+    let mut context_window_recovery_attempted = false;
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -320,6 +325,7 @@ pub(crate) async fn run_turn(
         .await;
         match sampling_request_result {
             Ok((sampling_request_output, sampling_request_input)) => {
+                context_window_recovery_attempted = false;
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -477,6 +483,49 @@ pub(crate) async fn run_turn(
             }
             Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
                 return Err(err);
+            }
+            Err(err)
+                if matches!(err.details(), CodexErrorDetails::ContextWindowExceeded)
+                    && !context_window_recovery_attempted =>
+            {
+                context_window_recovery_attempted = true;
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    "provider context window was smaller than the local estimate; compacting and retrying once"
+                );
+                if let Err(compact_err) = run_auto_compact(
+                    &sess,
+                    Arc::clone(&step_context),
+                    /*fallback_step_context*/ None,
+                    &mut client_session,
+                    InitialContextInjection::BeforeLastUserMessage {
+                        world_state: Arc::clone(&world_state),
+                        step_context: Arc::clone(&step_context),
+                    },
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::MidTurn,
+                )
+                .await
+                {
+                    if matches!(compact_err.details(), CodexErrorDetails::TurnAborted) {
+                        return Err(compact_err);
+                    }
+                    let error = compact_err.to_codex_protocol_error();
+                    sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+                        .await;
+                    sess.track_turn_codex_error(turn_context.as_ref(), &compact_err);
+                    sess.send_event(
+                        &turn_context,
+                        EventMsg::Error(compact_err.to_error_event(/*message_prefix*/ None)),
+                    )
+                    .await;
+                    return Ok(None);
+                }
+                if run_pending_session_start_hooks(&sess, &turn_context).await {
+                    return Ok(None);
+                }
+                can_drain_pending_input = false;
+                continue;
             }
             Err(codex_error)
                 if matches!(
@@ -1213,7 +1262,7 @@ async fn run_sampling_request(
             turn_context.as_ref(),
             base_instructions.clone(),
         );
-        let err = match try_run_sampling_request(
+        let sampling_result = try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -1224,8 +1273,8 @@ async fn run_sampling_request(
             &prompt,
             cancellation_token.child_token(),
         )
-        .await
-        {
+        .await;
+        let err = match sampling_result {
             Ok(output) => {
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
@@ -1236,6 +1285,8 @@ async fn run_sampling_request(
                 }
                 CodexErrorDetails::UsageLimitReached(e) => {
                     let rate_limits = e.rate_limits.clone();
+                    sess.record_usage_limit_reached(rate_limits.as_deref())
+                        .await;
                     if let Some(rate_limits) = rate_limits {
                         sess.update_rate_limits(&turn_context, *rate_limits).await;
                     }

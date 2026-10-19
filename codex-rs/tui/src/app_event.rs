@@ -194,13 +194,10 @@ pub(crate) enum AppEvent {
         op: AppCommand,
     },
 
-    /// Interrupt, fork, and retry a safety-buffered turn with the server-selected model.
-    RetrySafetyBufferedTurn {
+    /// Wake a non-overlapping, in-session `/loop` schedule.
+    LoopTick {
         thread_id: ThreadId,
-        turn_id: String,
-        model: String,
-        turn: AppCommand,
-        prompt: UserMessage,
+        generation: u64,
     },
 
     /// Deliver a synthetic history lookup response to a specific thread channel.

@@ -6,6 +6,8 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::user_input::UserInput;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
@@ -35,6 +37,7 @@ pub(crate) struct TurnInputQueue {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<InterAgentCommunication>>,
+    recorded_input_wakeup_pending: AtomicBool,
 }
 
 impl InputQueue {
@@ -43,7 +46,22 @@ impl InputQueue {
         Self {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
+            recorded_input_wakeup_pending: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn request_recorded_input_wakeup(&self) {
+        self.recorded_input_wakeup_pending
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn has_recorded_input_wakeup(&self) -> bool {
+        self.recorded_input_wakeup_pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn take_recorded_input_wakeup(&self) -> bool {
+        self.recorded_input_wakeup_pending
+            .swap(false, Ordering::AcqRel)
     }
 
     pub(crate) async fn subscribe_activity(
@@ -182,6 +200,20 @@ impl InputQueue {
         self.activity_tx.send_replace(InputQueueActivity::Steer);
     }
 
+    pub(super) async fn extend_background_output_wake_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+        input: Vec<TurnInput>,
+    ) {
+        {
+            let mut turn_state = turn_state.lock().await;
+            turn_state.pending_input.items.extend(input);
+            turn_state.mark_background_output_wake_pending();
+            turn_state.accept_mailbox_delivery_for_current_turn();
+        }
+        self.activity_tx.send_replace(InputQueueActivity::Steer);
+    }
+
     pub(crate) async fn extend_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,
@@ -213,7 +245,11 @@ impl InputQueue {
                     let accepts_mailbox_delivery =
                         turn_state.accepts_mailbox_delivery_for_current_turn();
                     let pending_input = if accepts_mailbox_delivery {
-                        turn_state.pending_input.items.split_off(0)
+                        let pending_input = turn_state.pending_input.items.split_off(0);
+                        if !pending_input.is_empty() {
+                            turn_state.clear_background_output_wake_pending();
+                        }
+                        pending_input
                     } else {
                         Vec::new()
                     };

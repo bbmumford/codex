@@ -2,6 +2,29 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
   "definitions": {
+    "BackgroundWatcherWire": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "default": null,
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "id"
+      ],
+      "type": "object"
+    },
     "BlockDecisionWire": {
       "enum": [
         "block"
@@ -14,6 +37,13 @@
         "additionalContext": {
           "default": null,
           "type": "string"
+        },
+        "backgroundWatchers": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/BackgroundWatcherWire"
+          },
+          "type": "array"
         },
         "hookEventName": {
           "const": "UserPromptSubmit",

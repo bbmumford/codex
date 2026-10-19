@@ -92,7 +92,6 @@ use uuid::Uuid;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
-use wiremock::matchers::body_string_contains;
 use wiremock::matchers::header;
 use wiremock::matchers::header_regex;
 use wiremock::matchers::method;
@@ -3619,24 +3618,27 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
 
     const EFFECTIVE_CONTEXT_WINDOW: i64 = (272_000 * 95) / 100;
 
-    mount_sse_once_match(
-        &server,
-        body_string_contains("trigger context window"),
-        sse_failed(
-            "resp_context_window",
-            "context_length_exceeded",
-            "Your input exceeds the context window of this model. Please adjust your input and try again.",
-        ),
-    )
-    .await;
+    let seed_response = sse(vec![
+        ev_response_created("resp_seed"),
+        ev_completed("resp_seed"),
+    ]);
+    let context_error = sse_failed(
+        "resp_context_window",
+        "context_length_exceeded",
+        "Your input exceeds the context window of this model. Please adjust your input and try again.",
+    );
 
-    mount_sse_once_match(
+    // The first authoritative rejection now triggers one bounded compaction attempt. Refuse that
+    // request as well so this test continues to cover the terminal accounting path without
+    // allowing an unbounded recovery loop.
+    let compact_context_error = sse_failed(
+        "resp_compact_context_window",
+        "context_length_exceeded",
+        "Your input exceeds the context window of this model. Please adjust your input and try again.",
+    );
+    mount_sse_sequence(
         &server,
-        body_string_contains("seed turn"),
-        sse(vec![
-            ev_response_created("resp_seed"),
-            ev_completed("resp_seed"),
-        ]),
+        vec![seed_response, context_error, compact_context_error],
     )
     .await;
 
@@ -3707,7 +3709,7 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
     assert!(
         matches!(
             error_event,
-            EventMsg::Error(ref err) if err.message == expected_context_window_message
+            EventMsg::Error(ref err) if err.message.contains(&expected_context_window_message)
         ),
         "expected context window error; got {error_event:?}"
     );

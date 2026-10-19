@@ -3870,9 +3870,54 @@ impl Session {
     }
 
     pub(crate) async fn record_rate_limits_info(&self, new_rate_limits: RateLimitSnapshot) {
+        self.persist_automatic_work_usage(&new_rate_limits, false)
+            .await;
         {
             let mut state = self.state.lock().await;
             state.set_rate_limits(new_rate_limits);
+        }
+    }
+
+    pub(crate) async fn record_usage_limit_reached(&self, rate_limits: Option<&RateLimitSnapshot>) {
+        if let Some(rate_limits) = rate_limits {
+            self.persist_automatic_work_usage(rate_limits, true).await;
+        } else if let Some(state_db) = self.state_db()
+            && let Err(err) = state_db
+                .record_automatic_work_usage(codex_state::AutomaticWorkUsageRecord {
+                    used_percent: None,
+                    resets_at: None,
+                    hard_limited: true,
+                })
+                .await
+        {
+            warn!("failed to persist automatic-work usage limit: {err}");
+        }
+    }
+
+    async fn persist_automatic_work_usage(
+        &self,
+        rate_limits: &RateLimitSnapshot,
+        hard_limited: bool,
+    ) {
+        if !matches!(rate_limits.limit_id.as_deref(), None | Some("codex")) {
+            return;
+        }
+        let Some(state_db) = self.state_db() else {
+            return;
+        };
+        let record = codex_state::AutomaticWorkUsageRecord {
+            used_percent: rate_limits
+                .primary
+                .as_ref()
+                .map(|window| window.used_percent),
+            resets_at: rate_limits
+                .primary
+                .as_ref()
+                .and_then(|window| window.resets_at),
+            hard_limited: hard_limited || rate_limits.rate_limit_reached_type.is_some(),
+        };
+        if let Err(err) = state_db.record_automatic_work_usage(record).await {
+            warn!("failed to persist automatic-work quota telemetry: {err}");
         }
     }
 

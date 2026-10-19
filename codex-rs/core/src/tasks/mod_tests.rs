@@ -2,6 +2,10 @@ use super::TASK_COMPACT_METRIC;
 use super::emit_compact_metric;
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
+use super::turn_input_is_background_output_wake;
+use crate::context::BackgroundOutputWake;
+use crate::context::ContextualUserFragment;
+use crate::session::TurnInput;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
@@ -17,6 +21,21 @@ use opentelemetry_sdk::metrics::data::MetricData;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
+
+#[test]
+fn background_output_wake_pending_input_requires_continuation() {
+    let item = ContextualUserFragment::into(BackgroundOutputWake::new(
+        -1,
+        "/usr/bin/example --watch",
+        "/tmp",
+        "ROLECALL-test",
+        0,
+    ));
+
+    assert!(turn_input_is_background_output_wake(
+        &TurnInput::ResponseItem(item)
+    ));
+}
 
 fn test_session_telemetry() -> SessionTelemetry {
     let exporter = InMemoryMetricExporter::default();

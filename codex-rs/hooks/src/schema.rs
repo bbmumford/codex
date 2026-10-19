@@ -396,6 +396,8 @@ pub(crate) struct SessionStartHookSpecificOutputWire {
     pub hook_event_name: HookEventNameWire,
     #[serde(default)]
     pub additional_context: Option<String>,
+    #[serde(default)]
+    pub background_watchers: Vec<BackgroundWatcherWire>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -442,6 +444,18 @@ pub(crate) struct UserPromptSubmitHookSpecificOutputWire {
     pub hook_event_name: HookEventNameWire,
     #[serde(default)]
     pub additional_context: Option<String>,
+    #[serde(default)]
+    pub background_watchers: Vec<BackgroundWatcherWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BackgroundWatcherWire {
+    pub id: String,
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

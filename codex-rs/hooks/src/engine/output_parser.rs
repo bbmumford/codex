@@ -10,6 +10,7 @@ pub(crate) struct UniversalOutput {
 pub(crate) struct SessionStartOutput {
     pub universal: UniversalOutput,
     pub additional_context: Option<String>,
+    pub background_watchers: Vec<crate::events::common::BackgroundWatcher>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,7 @@ pub(crate) struct UserPromptSubmitOutput {
     pub reason: Option<String>,
     pub invalid_block_reason: Option<String>,
     pub additional_context: Option<String>,
+    pub background_watchers: Vec<crate::events::common::BackgroundWatcher>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,10 +94,19 @@ use crate::schema::UserPromptSubmitCommandOutputWire;
 
 pub(crate) fn parse_session_start(stdout: &str) -> Option<SessionStartOutput> {
     let wire: SessionStartCommandOutputWire = parse_json(stdout)?;
+    let (additional_context, background_watchers) = wire
+        .hook_specific_output
+        .map(|output| {
+            (
+                output.additional_context,
+                parse_background_watchers(output.background_watchers),
+            )
+        })
+        .unwrap_or_default();
     Some(session_start_output(
         wire.universal,
-        wire.hook_specific_output
-            .and_then(|output| output.additional_context),
+        additional_context,
+        background_watchers,
     ))
 }
 
@@ -105,16 +116,19 @@ pub(crate) fn parse_subagent_start(stdout: &str) -> Option<SessionStartOutput> {
         wire.universal,
         wire.hook_specific_output
             .and_then(|output| output.additional_context),
+        Vec::new(),
     ))
 }
 
 fn session_start_output(
     universal: HookUniversalOutputWire,
     additional_context: Option<String>,
+    background_watchers: Vec<crate::events::common::BackgroundWatcher>,
 ) -> SessionStartOutput {
     SessionStartOutput {
         universal: UniversalOutput::from(universal),
         additional_context,
+        background_watchers,
     }
 }
 
@@ -268,16 +282,49 @@ pub(crate) fn parse_user_prompt_submit(stdout: &str) -> Option<UserPromptSubmitO
     } else {
         None
     };
-    let additional_context = wire
+    let (additional_context, background_watchers) = wire
         .hook_specific_output
-        .and_then(|output| output.additional_context);
+        .map(|output| {
+            (
+                output.additional_context,
+                parse_background_watchers(output.background_watchers),
+            )
+        })
+        .unwrap_or_default();
     Some(UserPromptSubmitOutput {
         universal: UniversalOutput::from(wire.universal),
         should_block: should_block && invalid_block_reason.is_none(),
         reason: wire.reason,
         invalid_block_reason,
         additional_context,
+        background_watchers,
     })
+}
+
+fn parse_background_watchers(
+    watchers: Vec<crate::schema::BackgroundWatcherWire>,
+) -> Vec<crate::events::common::BackgroundWatcher> {
+    watchers
+        .into_iter()
+        .filter_map(|watcher| {
+            let id = watcher.id.trim().to_string();
+            let command = watcher.command;
+            let valid = !id.is_empty()
+                && id.len() <= 128
+                && !command.is_empty()
+                && command.len() <= 64
+                && command.iter().all(|argument| !argument.is_empty())
+                && command.iter().map(String::len).sum::<usize>() <= 8192;
+            valid.then_some(crate::events::common::BackgroundWatcher {
+                id,
+                command,
+                cwd: watcher.cwd.and_then(|cwd| {
+                    let cwd = cwd.trim().to_string();
+                    (!cwd.is_empty()).then_some(cwd)
+                }),
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn parse_stop(stdout: &str) -> Option<StopOutput> {
@@ -518,7 +565,69 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
+    use crate::events::common::BackgroundWatcher;
+
     use super::parse_permission_request;
+    use super::parse_session_start;
+
+    #[test]
+    fn session_start_preserves_valid_background_watcher_argv() {
+        let parsed = parse_session_start(
+            &json!({
+                "continue": true,
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "backgroundWatchers": [{
+                        "id": " swarm-session ",
+                        "command": [
+                            "/Users/test/.swarm/swarmctl",
+                            "watch-session",
+                            "--session-id",
+                            "session with spaces"
+                        ],
+                        "cwd": " /Users/test "
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("session start hook output should parse");
+
+        assert_eq!(
+            parsed.background_watchers,
+            vec![BackgroundWatcher {
+                id: "swarm-session".to_string(),
+                command: vec![
+                    "/Users/test/.swarm/swarmctl".to_string(),
+                    "watch-session".to_string(),
+                    "--session-id".to_string(),
+                    "session with spaces".to_string(),
+                ],
+                cwd: Some("/Users/test".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn session_start_discards_invalid_background_watchers() {
+        let parsed = parse_session_start(
+            &json!({
+                "continue": true,
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "backgroundWatchers": [
+                        {"id": "", "command": ["/bin/echo"]},
+                        {"id": "empty-command", "command": []},
+                        {"id": "empty-argument", "command": ["/bin/echo", ""]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("session start hook output should parse");
+
+        assert_eq!(parsed.background_watchers, Vec::new());
+    }
 
     #[test]
     fn permission_request_rejects_reserved_updated_input_field() {

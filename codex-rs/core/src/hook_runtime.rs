@@ -51,6 +51,7 @@ use crate::tools::sandboxing::PermissionRequestPayload;
 pub(crate) struct HookRuntimeOutcome {
     pub should_stop: bool,
     pub additional_contexts: Vec<String>,
+    pub background_watchers: Vec<codex_hooks::BackgroundWatcher>,
 }
 
 pub(crate) enum PreToolUseHookResult {
@@ -70,12 +71,14 @@ impl From<SessionStartOutcome> for ContextInjectingHookOutcome {
             should_stop,
             stop_reason: _,
             additional_contexts,
+            background_watchers,
         } = value;
         Self {
             hook_events,
             outcome: HookRuntimeOutcome {
                 should_stop,
                 additional_contexts,
+                background_watchers,
             },
         }
     }
@@ -88,12 +91,14 @@ impl From<UserPromptSubmitOutcome> for ContextInjectingHookOutcome {
             should_stop,
             stop_reason: _,
             additional_contexts,
+            background_watchers,
         } = value;
         Self {
             hook_events,
             outcome: HookRuntimeOutcome {
                 should_stop,
                 additional_contexts,
+                background_watchers,
             },
         }
     }
@@ -560,10 +565,12 @@ pub(crate) async fn inspect_pending_input(
         TurnInput::ResponseItem(_) => HookRuntimeOutcome {
             should_stop: false,
             additional_contexts: Vec::new(),
+            background_watchers: Vec::new(),
         },
         TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome {
             should_stop: false,
             additional_contexts: Vec::new(),
+            background_watchers: Vec::new(),
         },
     }
 }
@@ -609,7 +616,14 @@ where
 
     let outcome = outcome_future.await.into();
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
-    outcome.outcome
+    let mut runtime_outcome = outcome.outcome;
+    sess.services
+        .unified_exec_manager
+        .apply_hook_background_watchers(
+            Arc::clone(sess),
+            std::mem::take(&mut runtime_outcome.background_watchers),
+        );
+    runtime_outcome
 }
 
 impl HookRuntimeOutcome {

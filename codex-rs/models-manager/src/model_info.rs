@@ -24,12 +24,14 @@ const PERSONALITY_SECTION_HEADER: &str = "# Personality";
 
 pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo {
     if let Some(context_window) = config.model_context_window {
+        // A catalog maximum is provider authority, not a UI hint. Let uncatalogued custom
+        // providers use an explicit local value, but never advertise a larger physical window
+        // than the selected catalog model can accept. Otherwise auto-compaction waits past the
+        // provider limit and every long-running turn ends in `context_length_exceeded`.
         model.context_window = Some(
             model
                 .max_context_window
-                .map_or(context_window, |max_context_window| {
-                    context_window.min(max_context_window)
-                }),
+                .map_or(context_window, |maximum| context_window.min(maximum)),
         );
     }
     if let Some(auto_compact_token_limit) = config.model_auto_compact_token_limit {

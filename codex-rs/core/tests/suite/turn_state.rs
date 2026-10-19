@@ -65,6 +65,11 @@ async fn responses_turn_state_persists_within_turn_and_resets_after() -> Result<
         Some("ts-1".to_string())
     );
     assert_eq!(requests[2].header(TURN_STATE_HEADER), None);
+    assert_eq!(
+        requests[0].body_json()["prompt_cache_key"],
+        requests[2].body_json()["prompt_cache_key"],
+        "resetting turn state must not discard the thread-stable prompt cache key"
+    );
 
     let parse_turn_id = |header: Option<String>| {
         let value = header?;

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use super::REMOTE_COMPACTION_CONTEXT_RETRY_TARGET_PERCENTS;
 use super::trim_function_call_history_to_fit_context_window;
+use super::trim_history_for_remote_compaction_context_retry;
 use crate::Prompt;
 use crate::client::CompactConversationRequestSettings;
 use crate::compact::CompactionAnalyticsDetails;
@@ -10,10 +12,12 @@ use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use codex_protocol::auth::AuthMode;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_rollout_trace::CompactionTraceContext;
 use tracing::info;
+use tracing::warn;
 
 pub(super) struct RemoteCompactAttempt {
     pub(super) new_history: Vec<ResponseItem>,
@@ -55,48 +59,93 @@ pub(super) async fn run_remote_compact_attempt(
                     .saturating_sub(estimated_deleted_tokens.min(max_local_deleted_tokens))
             });
     }
-    let trace_input_history = compaction_trace
-        .is_enabled()
-        .then(|| history.raw_items().to_vec());
-    let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
-    let tool_router = &step_context.tool_router;
-    let prompt = Prompt {
-        input: prompt_input,
-        tools: tool_router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
-        base_instructions,
-        output_schema: None,
-        output_schema_strict: true,
-    };
     let window_id = sess.current_window_id().await;
     let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
         sess.installation_id.clone(),
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
-    let new_history = sess
-        .services
-        .model_client
-        .compact_conversation_history(
-            &prompt,
-            &turn_context.model_info,
-            turn_state,
-            CompactConversationRequestSettings {
-                effort: turn_context.reasoning_effort.clone(),
-                summary: turn_context.reasoning_summary,
-                service_tier: if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
-                    None
-                } else {
-                    turn_context.config.service_tier.clone()
+    let mut context_retry_index = 0usize;
+    loop {
+        let trace_input_history = compaction_trace
+            .is_enabled()
+            .then(|| history.raw_items().to_vec());
+        let prompt_input = history
+            .clone()
+            .for_prompt(&turn_context.model_info.input_modalities);
+        let tool_router = &step_context.tool_router;
+        let prompt = Prompt {
+            input: prompt_input,
+            tools: tool_router.model_visible_specs(),
+            parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+            base_instructions: base_instructions.clone(),
+            output_schema: None,
+            output_schema_strict: true,
+        };
+        let result = sess
+            .services
+            .model_client
+            .compact_conversation_history(
+                &prompt,
+                &turn_context.model_info,
+                turn_state.clone(),
+                CompactConversationRequestSettings {
+                    effort: turn_context.reasoning_effort.clone(),
+                    summary: turn_context.reasoning_summary,
+                    service_tier: if sess.services.auth_manager.auth_mode()
+                        == Some(AuthMode::ApiKey)
+                    {
+                        None
+                    } else {
+                        turn_context.config.service_tier.clone()
+                    },
                 },
-            },
-            &turn_context.session_telemetry,
-            compaction_trace,
-            &responses_metadata,
-        )
-        .await?;
-    Ok(RemoteCompactAttempt {
-        new_history,
-        trace_input_history,
-    })
+                &turn_context.session_telemetry,
+                compaction_trace,
+                &responses_metadata,
+            )
+            .await;
+
+        match result {
+            Ok(new_history) => {
+                return Ok(RemoteCompactAttempt {
+                    new_history,
+                    trace_input_history,
+                });
+            }
+            Err(err)
+                if matches!(err.details(), CodexErrorDetails::ContextWindowExceeded)
+                    && context_retry_index
+                        < REMOTE_COMPACTION_CONTEXT_RETRY_TARGET_PERCENTS.len() =>
+            {
+                let target_percent =
+                    REMOTE_COMPACTION_CONTEXT_RETRY_TARGET_PERCENTS[context_retry_index];
+                let (removed_items, estimated_deleted_tokens) =
+                    trim_history_for_remote_compaction_context_retry(
+                        &mut history,
+                        turn_context.as_ref(),
+                        &base_instructions,
+                        target_percent,
+                    );
+                if removed_items == 0 {
+                    return Err(err);
+                }
+                analytics_details.active_context_tokens_before = analytics_details
+                    .active_context_tokens_before
+                    .map(|active_context_tokens_before| {
+                        active_context_tokens_before.saturating_sub(estimated_deleted_tokens)
+                    });
+                context_retry_index += 1;
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    context_retry_index,
+                    removed_items,
+                    estimated_deleted_tokens,
+                    target_percent,
+                    "remote compaction exceeded provider context; retrying with recent history"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }

@@ -119,6 +119,19 @@ pub(crate) fn interrupted_turn_history_marker(
     }
 }
 
+fn turn_input_is_background_output_wake(input: &TurnInput) -> bool {
+    let TurnInput::ResponseItem(ResponseItem::Message { role, content, .. }) = input else {
+        return false;
+    };
+    if role != "user" {
+        return false;
+    }
+    let (start, _) = crate::context::BackgroundOutputWake::type_markers();
+    content
+        .iter()
+        .any(|item| matches!(item, ContentItem::InputText { text } if text.starts_with(start)))
+}
+
 fn emit_turn_network_proxy_metric(
     session_telemetry: &SessionTelemetry,
     network_proxy_active: bool,
@@ -329,6 +342,9 @@ impl Session {
         task: T,
     ) {
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
+        // Any new sampled task will observe recorded history, including a wake
+        // that lost the teardown race, so it satisfies the pending continuation.
+        self.input_queue.take_recorded_input_wakeup();
         let task_kind = task.kind();
         let span_name = task.span_name();
         let started_at = Instant::now();
@@ -484,9 +500,12 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
-        if !self.input_queue.has_pending_mailbox_items().await
-            || (!self.input_queue.has_trigger_turn_mailbox_items().await
-                && !self.has_outstanding_durable_sleep())
+        let has_recorded_input_wakeup = self.input_queue.has_recorded_input_wakeup();
+        let has_pending_mailbox = self.input_queue.has_pending_mailbox_items().await;
+        if !has_recorded_input_wakeup
+            && (!has_pending_mailbox
+                || (!self.input_queue.has_trigger_turn_mailbox_items().await
+                    && !self.has_outstanding_durable_sleep()))
         {
             return;
         }
@@ -497,6 +516,10 @@ impl Session {
                 return;
             }
             *active_turn = Some(ActiveTurn::default());
+        }
+
+        if has_recorded_input_wakeup {
+            self.input_queue.take_recorded_input_wakeup();
         }
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
@@ -611,16 +634,25 @@ impl Session {
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())
             .await;
-        let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
+        let (
+            turn_had_memory_citation,
+            turn_tool_calls,
+            token_usage_at_turn_start,
+            background_output_wake_was_pending,
+        ) = {
             let ts = turn_state.lock().await;
             (
                 ts.has_memory_citation,
                 ts.tool_calls,
                 ts.token_usage_at_turn_start.clone(),
+                ts.background_output_wake_pending(),
             )
         };
+        let mut recorded_background_output_wake = false;
         if !pending_input.is_empty() {
             for pending_input_item in pending_input {
+                let is_background_output_wake =
+                    turn_input_is_background_output_wake(&pending_input_item);
                 let hook_outcome =
                     inspect_pending_input(self, &turn_context, &pending_input_item).await;
                 if hook_outcome.should_stop {
@@ -638,6 +670,8 @@ impl Session {
                         hook_outcome.additional_contexts,
                     )
                     .await;
+                    recorded_background_output_wake |=
+                        background_output_wake_was_pending && is_background_output_wake;
                 }
             }
         }
@@ -829,13 +863,16 @@ impl Session {
                 false
             }
         };
-        if cleared_active_turn {
+        if cleared_active_turn && !recorded_background_output_wake {
             self.emit_thread_idle_lifecycle_if_idle().await;
         }
         // Regular items were flushed before this terminal event was appended; buffering
         // thread writers may not flush it without another explicit barrier.
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        }
+        if recorded_background_output_wake {
+            self.input_queue.request_recorded_input_wakeup();
         }
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;

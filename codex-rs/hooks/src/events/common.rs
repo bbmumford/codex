@@ -16,6 +16,14 @@ pub struct SubagentHookContext {
     pub agent_type: String,
 }
 
+/// A trusted lifecycle hook command whose stdout should wake an idle session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundWatcher {
+    pub id: String,
+    pub command: Vec<String>,
+    pub cwd: Option<String>,
+}
+
 pub(crate) fn join_text_chunks(chunks: Vec<String>) -> Option<String> {
     if chunks.is_empty() {
         None

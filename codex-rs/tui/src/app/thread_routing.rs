@@ -731,7 +731,7 @@ impl App {
                             .as_ref()
                             .map(|profile| &profile.permission_profile),
                     );
-                    let response = app_server
+                    app_server
                         .turn_start(
                             thread_id,
                             items.to_vec(),
@@ -749,12 +749,6 @@ impl App {
                             final_output_json_schema.clone(),
                         )
                         .await?;
-                    if self.active_thread_id == Some(thread_id)
-                        && self.chat_widget.thread_id() == Some(thread_id)
-                    {
-                        self.chat_widget
-                            .record_safety_buffering_turn(response.turn.id, op);
-                    }
                 }
                 Ok(true)
             }

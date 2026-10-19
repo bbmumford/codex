@@ -39,6 +39,7 @@ pub struct UserPromptSubmitOutcome {
     pub should_stop: bool,
     pub stop_reason: Option<String>,
     pub additional_contexts: Vec<String>,
+    pub background_watchers: Vec<common::BackgroundWatcher>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -46,6 +47,7 @@ struct UserPromptSubmitHandlerData {
     should_stop: bool,
     stop_reason: Option<String>,
     additional_contexts_for_model: Vec<AdditionalContext>,
+    background_watchers: Vec<common::BackgroundWatcher>,
 }
 
 pub(crate) fn preview(
@@ -80,6 +82,7 @@ pub(crate) async fn run(
             should_stop: false,
             stop_reason: None,
             additional_contexts: Vec::new(),
+            background_watchers: Vec::new(),
         };
     }
 
@@ -128,12 +131,17 @@ pub(crate) async fn run(
     let additional_contexts = output_spiller
         .maybe_spill_additional_contexts(session_id, additional_contexts)
         .await;
+    let background_watchers = results
+        .iter()
+        .flat_map(|result| result.data.background_watchers.iter().cloned())
+        .collect();
 
     UserPromptSubmitOutcome {
         hook_events: results.into_iter().map(|result| result.completed).collect(),
         should_stop,
         stop_reason,
         additional_contexts,
+        background_watchers,
     }
 }
 
@@ -147,6 +155,7 @@ fn parse_completed(
     let mut should_stop = false;
     let mut stop_reason = None;
     let mut additional_contexts_for_model = Vec::new();
+    let mut background_watchers = Vec::new();
 
     match run_result.error.as_deref() {
         Some(error) => {
@@ -163,6 +172,7 @@ fn parse_completed(
                 } else if let Some(parsed) =
                     output_parser::parse_user_prompt_submit(&run_result.stdout)
                 {
+                    background_watchers = parsed.background_watchers;
                     if let Some(system_message) = parsed.universal.system_message {
                         entries.push(HookOutputEntry {
                             kind: HookOutputEntryKind::Warning,
@@ -268,6 +278,7 @@ fn parse_completed(
             should_stop,
             stop_reason,
             additional_contexts_for_model,
+            background_watchers,
         },
         completion_order: 0,
     }
@@ -279,6 +290,7 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> UserPr
         should_stop: false,
         stop_reason: None,
         additional_contexts: Vec::new(),
+        background_watchers: Vec::new(),
     }
 }
 
@@ -297,6 +309,27 @@ mod tests {
     use crate::engine::ConfiguredHandler;
     use crate::engine::command_runner::CommandRunResult;
     use crate::output_spill::AdditionalContext;
+
+    #[test]
+    fn empty_success_is_a_silent_noop() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(Some(0), "", ""),
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(
+            parsed.data,
+            UserPromptSubmitHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                background_watchers: Vec::new(),
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
+        assert_eq!(parsed.completed.run.entries, Vec::new());
+    }
 
     #[test]
     fn continue_false_preserves_context_for_later_turns() {
@@ -319,6 +352,7 @@ mod tests {
                     text: "do not inject".to_string(),
                     limit: Default::default(),
                 }],
+                background_watchers: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Stopped);
@@ -358,6 +392,7 @@ mod tests {
                     text: "do not inject".to_string(),
                     limit: Default::default(),
                 }],
+                background_watchers: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
@@ -394,6 +429,7 @@ mod tests {
                 should_stop: false,
                 stop_reason: None,
                 additional_contexts_for_model: Vec::new(),
+                background_watchers: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
@@ -421,6 +457,7 @@ mod tests {
                 should_stop: true,
                 stop_reason: Some("blocked by policy".to_string()),
                 additional_contexts_for_model: Vec::new(),
+                background_watchers: Vec::new(),
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anyhow::Result;
 use codex_agent_extension::AgentInvocation;
 use codex_agent_extension::AgentRunner;

@@ -9,8 +9,9 @@
 //! call site.
 //!
 //! A [`ModelClientSession`] is created per turn and is used to stream one or more Responses API
-//! requests during that turn. It caches a Responses WebSocket connection (opened lazily) and stores
-//! per-turn state such as the `x-codex-turn-state` token used for sticky routing.
+//! requests during that turn. It caches a Responses WebSocket connection (opened lazily). This
+//! fork can replay `x-codex-turn-state` across turns and short process restarts, but only while the
+//! authenticated account remains the same.
 //!
 //! WebSocket prewarm is a v2-only `response.create` with `generate=false`; it waits for completion
 //! so the next request can reuse the same connection and `previous_response_id`.
@@ -213,7 +214,7 @@ struct ModelClientState {
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
-    cached_websocket_session: StdMutex<WebsocketSession>,
+    account_scoped_transport: StdMutex<AccountScopedTransportState>,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -260,29 +261,26 @@ pub struct ModelClient {
 /// A turn-scoped streaming session created from a [`ModelClient`].
 ///
 /// The session establishes a Responses WebSocket connection lazily and reuses it across multiple
-/// requests within the turn. It also caches per-turn state:
+/// requests within the turn. It also caches request-continuation state:
 ///
 /// - The last full request, so subsequent calls can reuse incremental websocket request payloads
 ///   only when the current request is an incremental extension of the previous one.
 /// - The `x-codex-turn-state` sticky-routing token, which must be replayed for all requests within
 ///   the same turn.
 ///
-/// Create a fresh `ModelClientSession` for each Codex turn. Reusing it across turns would replay
-/// the previous turn's sticky-routing token into the next turn, which violates the client/server
-/// contract and can cause routing bugs.
+/// Create a fresh `ModelClientSession` for each Codex turn. The WebSocket transport may be reused
+/// for the same account, but `x-codex-turn-state` must not cross the logical turn boundary. A
+/// credential change rotates both the routing state and WebSocket state before another request can
+/// be sent.
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    account_id: Option<String>,
     /// Turn state for sticky routing.
     ///
-    /// This is an `OnceLock` that stores the turn state value received from the server
-    /// on turn start via the `x-codex-turn-state` response header. Once set, this value
-    /// should be sent back to the server in the `x-codex-turn-state` request header for
-    /// all subsequent requests within the same turn to maintain sticky routing.
-    ///
-    /// This is a contract between the client and server: we receive it at turn start,
-    /// keep sending it unchanged between turn requests (e.g., for retries, incremental
-    /// appends, or continuation requests), and must not send it between different turns.
+    /// This value is received from the server at turn start and replayed only for later requests
+    /// in this same logical turn. Replaying it on a new turn can pin fresh input to stale server
+    /// routing, context, or policy state.
     turn_state: Arc<OnceLock<String>>,
 }
 
@@ -299,6 +297,12 @@ struct WebsocketSession {
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
     connection_reused: StdMutex<bool>,
+}
+
+#[derive(Debug, Default)]
+struct AccountScopedTransportState {
+    account_id: Option<String>,
+    websocket_session: WebsocketSession,
 }
 
 // This is intentionally not a `PartialEq` implementation: request equality includes `input` and
@@ -464,7 +468,7 @@ impl ModelClient {
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
-                cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                account_scoped_transport: StdMutex::new(AccountScopedTransportState::default()),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
@@ -491,9 +495,17 @@ impl ModelClient {
     /// This constructor does not perform network I/O itself; the session opens a websocket lazily
     /// when the first stream request is issued.
     pub fn new_session(&self) -> ModelClientSession {
+        let mut transport = self
+            .state
+            .account_scoped_transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let account_id = transport.account_id.clone();
+        let websocket_session = std::mem::take(&mut transport.websocket_session);
         ModelClientSession {
             client: self.clone(),
-            websocket_session: self.take_cached_websocket_session(),
+            websocket_session,
+            account_id,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -502,21 +514,19 @@ impl ModelClient {
         self.state.provider.auth_manager()
     }
 
-    fn take_cached_websocket_session(&self) -> WebsocketSession {
-        let mut cached_websocket_session = self
+    fn store_cached_websocket_session(
+        &self,
+        account_id: Option<&str>,
+        websocket_session: WebsocketSession,
+    ) {
+        let mut transport = self
             .state
-            .cached_websocket_session
+            .account_scoped_transport
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *cached_websocket_session)
-    }
-
-    fn store_cached_websocket_session(&self, websocket_session: WebsocketSession) {
-        *self
-            .state
-            .cached_websocket_session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
+        if transport.account_id.as_deref() == account_id {
+            transport.websocket_session = websocket_session;
+        }
     }
 
     pub(crate) fn force_http_fallback(
@@ -536,7 +546,11 @@ impl ModelClient {
             );
         }
 
-        self.store_cached_websocket_session(WebsocketSession::default());
+        self.state
+            .account_scoped_transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .websocket_session = WebsocketSession::default();
         activated
     }
 
@@ -1116,13 +1130,35 @@ impl Drop for ModelClientSession {
     fn drop(&mut self) {
         let websocket_session = std::mem::take(&mut self.websocket_session);
         self.client
-            .store_cached_websocket_session(websocket_session);
+            .store_cached_websocket_session(self.account_id.as_deref(), websocket_session);
     }
 }
 
 impl ModelClientSession {
     pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
         Arc::clone(&self.turn_state)
+    }
+
+    fn ensure_auth_scope(&mut self, auth: Option<&CodexAuth>) {
+        let account_id = auth.and_then(CodexAuth::get_account_id);
+        if self.account_id == account_id {
+            return;
+        }
+        self.reset_websocket_session();
+        self.turn_state = Arc::new(OnceLock::new());
+        let mut transport = self
+            .client
+            .state
+            .account_scoped_transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if transport.account_id != account_id {
+            *transport = AccountScopedTransportState {
+                account_id: account_id.clone(),
+                ..AccountScopedTransportState::default()
+            };
+        }
+        self.account_id = account_id;
     }
 
     fn reset_websocket_session(&mut self) {
@@ -1263,15 +1299,15 @@ impl ModelClientSession {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
-        if self.websocket_session.connection.is_some() {
-            return Ok(());
-        }
-
         let client_setup = self.client.current_client_setup().await.map_err(|err| {
             ApiError::Stream(format!(
                 "failed to build websocket prewarm client setup: {err}"
             ))
         })?;
+        self.ensure_auth_scope(client_setup.auth.as_ref());
+        if self.websocket_session.connection.is_some() {
+            return Ok(());
+        }
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             client_setup.api_auth.as_ref(),
@@ -1393,7 +1429,7 @@ impl ModelClientSession {
         )
     )]
     async fn stream_responses_api(
-        &self,
+        &mut self,
         prompt: &Prompt,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
@@ -1410,6 +1446,7 @@ impl ModelClientSession {
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.client.current_client_setup().await?;
+            self.ensure_auth_scope(client_setup.auth.as_ref());
             let transport = self
                 .client
                 .build_api_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)?;
@@ -1540,6 +1577,7 @@ impl ModelClientSession {
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.client.current_client_setup().await?;
+            self.ensure_auth_scope(client_setup.auth.as_ref());
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),

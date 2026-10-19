@@ -70,24 +70,32 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
-                        && let Some(error) = parsed.get("error")
-                        && error.get("code").and_then(Value::as_str)
-                            == Some(CYBER_POLICY_ERROR_CODE)
+                    let parsed_error = serde_json::from_str::<Value>(&body_text)
+                        .ok()
+                        .and_then(|parsed| parsed.get("error").cloned());
+                    match parsed_error
+                        .as_ref()
+                        .and_then(|error| error.get("code"))
+                        .and_then(Value::as_str)
                     {
-                        let message = error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .filter(|message| !message.trim().is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
-                        CodexErr::new(CodexErrorDetails::CyberPolicy { message })
-                    } else if body_text
-                        .contains("The image data you provided does not represent a valid image")
-                    {
-                        CodexErr::InvalidImageRequest()
-                    } else {
-                        CodexErr::InvalidRequest(body_text)
+                        Some(CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) => CodexErr::ContextWindowExceeded,
+                        Some(CYBER_POLICY_ERROR_CODE) => {
+                            let message = parsed_error
+                                .as_ref()
+                                .and_then(|error| error.get("message"))
+                                .and_then(Value::as_str)
+                                .filter(|message| !message.trim().is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
+                            CodexErr::new(CodexErrorDetails::CyberPolicy { message })
+                        }
+                        _ if body_text.contains(
+                            "The image data you provided does not represent a valid image",
+                        ) =>
+                        {
+                            CodexErr::InvalidImageRequest()
+                        }
+                        _ => CodexErr::InvalidRequest(body_text),
                     }
                 } else if status == http::StatusCode::INTERNAL_SERVER_ERROR {
                     CodexErr::InternalServerError
@@ -161,6 +169,7 @@ const CF_RAY_HEADER: &str = "cf-ray";
 const X_OPENAI_AUTHORIZATION_ERROR_HEADER: &str = "x-openai-authorization-error";
 const X_ERROR_JSON_HEADER: &str = "x-error-json";
 const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
+const CONTEXT_WINDOW_EXCEEDED_ERROR_CODE: &str = "context_length_exceeded";
 const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";
 const CLOUDFLARE_BLOCKED_MESSAGE: &str =

@@ -46,6 +46,7 @@ use crate::tools::network_approval::DeferredNetworkApproval;
 mod async_watcher;
 mod errors;
 mod head_tail_buffer;
+mod hook_watcher;
 mod process;
 mod process_manager;
 mod process_state;
@@ -146,6 +147,7 @@ impl ProcessStore {
 
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Mutex<ProcessStore>,
+    hook_watchers: std::sync::Mutex<HashMap<String, HookWatcherEntry>>,
     max_write_stdin_yield_time_ms: u64,
 }
 
@@ -153,6 +155,7 @@ impl UnifiedExecProcessManager {
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
         Self {
             process_store: Mutex::new(ProcessStore::default()),
+            hook_watchers: std::sync::Mutex::new(HashMap::new()),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
         }
@@ -176,6 +179,12 @@ struct ProcessEntry {
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+}
+
+struct HookWatcherEntry {
+    directive: codex_hooks::BackgroundWatcher,
+    cancellation: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {

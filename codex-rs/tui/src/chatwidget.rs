@@ -353,6 +353,7 @@ mod input_submission;
 mod interrupts;
 use self::interrupts::InterruptManager;
 mod keymap_picker;
+mod loop_schedule;
 mod mcp_startup;
 use self::mcp_startup::McpStartupStatus;
 mod pets;
@@ -647,6 +648,8 @@ pub(crate) struct ChatWidget {
     #[cfg(test)]
     pet_image_support_override: Option<crate::pets::PetImageSupport>,
     thread_id: Option<ThreadId>,
+    loop_schedule: Option<loop_schedule::LoopSchedule>,
+    loop_generation: u64,
     /// Nudge dismissals that should survive draft edits within the current thread scope.
     ///
     /// The nudge is only a discovery aid, so once a user dismisses it or enters Plan mode we keep it
@@ -1945,6 +1948,7 @@ fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {
 
 impl Drop for ChatWidget {
     fn drop(&mut self) {
+        self.stop_loop_schedule(/*show_status*/ false);
         self.stop_rate_limit_poller();
     }
 }

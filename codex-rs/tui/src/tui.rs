@@ -49,16 +49,12 @@ use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::tui::event_stream::EventBroker;
 use crate::tui::event_stream::TuiEventStream;
-#[cfg(unix)]
-use crate::tui::job_control::SuspendContext;
 use codex_config::types::NotificationCondition;
 use codex_config::types::NotificationMethod;
 
 mod event_stream;
 mod frame_rate_limiter;
 mod frame_requester;
-#[cfg(unix)]
-mod job_control;
 mod keyboard_modes;
 mod terminal_stderr;
 #[cfg(test)]
@@ -324,25 +320,6 @@ fn restore_common(
     }
 }
 
-/// Restore the terminal to its original state.
-/// Inverse of `set_modes`.
-#[cfg(unix)]
-pub fn restore() -> Result<()> {
-    restore_common(RawModeRestore::Disable, KeyboardRestore::PopStack)
-}
-
-/// Force crossterm's cached raw-mode state back in sync with the terminal after `fg`.
-///
-/// A shell may restore the job's saved termios after the process receives `SIGCONT`. When that
-/// races with [`set_modes`], crossterm still believes raw mode is enabled even though the terminal
-/// has returned to canonical, echoing mode. Clearing crossterm's saved state before enabling raw
-/// mode again makes the kernel state authoritative once the shell has completed its handoff.
-#[cfg(unix)]
-pub(super) fn reapply_raw_mode_after_resume() -> Result<()> {
-    disable_raw_mode()?;
-    enable_raw_mode()
-}
-
 /// Restore the terminal after Codex is exiting.
 ///
 /// Uses a stronger keyboard reset than `restore` so the parent shell recovers even if a
@@ -565,8 +542,6 @@ pub struct Tui {
     ambient_pet_image_state: crate::pets::PetImageRenderState,
     pet_picker_preview_image_state: crate::pets::PetImageRenderState,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
-    #[cfg(unix)]
-    suspend_context: SuspendContext,
     // True when overlay alt-screen UI is active
     alt_screen_active: Arc<AtomicBool>,
     // True when terminal/tab is focused; updated internally from crossterm events
@@ -622,8 +597,6 @@ impl Tui {
             ambient_pet_image_state: crate::pets::PetImageRenderState::default(),
             pet_picker_preview_image_state: crate::pets::PetImageRenderState::default(),
             alt_saved_viewport: None,
-            #[cfg(unix)]
-            suspend_context: SuspendContext::new(),
             alt_screen_active: Arc::new(AtomicBool::new(false)),
             terminal_focused: Arc::new(AtomicBool::new(true)),
             enhanced_keys_supported,
@@ -746,15 +719,6 @@ impl Tui {
     }
 
     pub fn event_stream(&self) -> Pin<Box<dyn Stream<Item = TuiEvent> + Send + 'static>> {
-        #[cfg(unix)]
-        let stream = TuiEventStream::new(
-            self.event_broker.clone(),
-            self.draw_tx.subscribe(),
-            self.terminal_focused.clone(),
-            self.suspend_context.clone(),
-            self.alt_screen_active.clone(),
-        );
-        #[cfg(not(unix))]
         let stream = TuiEventStream::new(
             self.event_broker.clone(),
             self.draw_tx.subscribe(),
@@ -914,13 +878,6 @@ impl Tui {
         height: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> Result<()> {
-        // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
-        // in the synchronized update.
-        #[cfg(unix)]
-        let mut prepared_resume = self
-            .suspend_context
-            .prepare_resume_action(&mut self.alt_saved_viewport);
-
         // Precompute any viewport updates that need a cursor-position query before entering
         // the synchronized update, to avoid racing with the event reader.
         let mut pending_viewport_area = self.pending_viewport_area()?;
@@ -928,11 +885,6 @@ impl Tui {
         ensure_virtual_terminal_processing()?;
 
         stdout().sync_update(|_| {
-            #[cfg(unix)]
-            if let Some(prepared) = prepared_resume.take() {
-                prepared.apply(&mut self.terminal)?;
-            }
-
             let terminal = &mut self.terminal;
             if let Some(new_area) = pending_viewport_area.take() {
                 terminal.set_viewport_area(new_area);
@@ -963,20 +915,6 @@ impl Tui {
                 &mut self.pending_history_lines,
                 self.is_zellij,
             )?;
-
-            // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
-            #[cfg(unix)]
-            {
-                let area = terminal.viewport_area;
-                let inline_area_bottom = if self.alt_screen_active.load(Ordering::Relaxed) {
-                    self.alt_saved_viewport
-                        .map(|r| r.bottom().saturating_sub(1))
-                        .unwrap_or_else(|| area.bottom().saturating_sub(1))
-                } else {
-                    area.bottom().saturating_sub(1)
-                };
-                self.suspend_context.set_cursor_y(inline_area_bottom);
-            }
 
             terminal.draw(|frame| {
                 draw_fn(frame);
@@ -1050,21 +988,9 @@ impl Tui {
         height: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> Result<()> {
-        // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
-        // in the synchronized update.
-        #[cfg(unix)]
-        let mut prepared_resume = self
-            .suspend_context
-            .prepare_resume_action(&mut self.alt_saved_viewport);
-
         ensure_virtual_terminal_processing()?;
 
         stdout().sync_update(|_| {
-            #[cfg(unix)]
-            if let Some(prepared) = prepared_resume.take() {
-                prepared.apply(&mut self.terminal)?;
-            }
-
             let terminal = &mut self.terminal;
             let needs_full_repaint =
                 Self::update_inline_viewport_for_resize_reflow(terminal, height)?;
@@ -1076,20 +1002,6 @@ impl Tui {
 
             if needs_full_repaint {
                 terminal.invalidate_viewport();
-            }
-
-            // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
-            #[cfg(unix)]
-            {
-                let area = terminal.viewport_area;
-                let inline_area_bottom = if self.alt_screen_active.load(Ordering::Relaxed) {
-                    self.alt_saved_viewport
-                        .map(|r| r.bottom().saturating_sub(1))
-                        .unwrap_or_else(|| area.bottom().saturating_sub(1))
-                } else {
-                    area.bottom().saturating_sub(1)
-                };
-                self.suspend_context.set_cursor_y(inline_area_bottom);
             }
 
             terminal.draw(|frame| {
